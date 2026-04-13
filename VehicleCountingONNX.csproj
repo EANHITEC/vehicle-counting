@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.24.3" />
+    <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260308" />
+    <PackageReference Include="OpenCvSharp4.official.runtime.ubuntu.22.04-x64" Version="4.13.0.20260214" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="gas_station_yolo11m.onnx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <Target Name="CopyOpenCvSharpExtern" AfterTargets="Build">
+    <ItemGroup>
+      <OpenCvSharpExternFile Include="$(NuGetPackageRoot)opencvsharp4.official.runtime.ubuntu.22.04-x64/*/runtimes/ubuntu.22.04-x64/native/libOpenCvSharpExtern.so" />
+    </ItemGroup>
+    <Copy
+      SourceFiles="@(OpenCvSharpExternFile)"
+      DestinationFolder="$(OutDir)"
+      SkipUnchangedFiles="true"
+      Condition="'@(OpenCvSharpExternFile)' != ''" />
+  </Target>
+</Project>
