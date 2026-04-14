@@ -360,6 +360,7 @@ sealed class LatestFrameReader : IDisposable
     private bool _ended;
     private string? _failureMessage;
     private double _lastSuccessAt;
+    private double _lastFrameTime;
 
     public LatestFrameReader(string cameraKey, string source, double maxFps)
     {
@@ -412,6 +413,11 @@ sealed class LatestFrameReader : IDisposable
         get { lock (_sync) return _ended; }
     }
 
+    public double LastFrameTime
+    {
+        get { lock (_sync) return _lastFrameTime; }
+    }
+
     private async Task ReadLoopAsync()
     {
         try
@@ -431,15 +437,18 @@ sealed class LatestFrameReader : IDisposable
 
                 if (success)
                 {
+                    var frameTime = TimeUtil.MonotonicSeconds();
+
                     lock (_sync)
                     {
                         _latestFrame?.Dispose();
                         _latestFrame = frame;
                         _latestFrameId++;
                         _frameSize = new Size(frame.Width, frame.Height);
+                        _lastFrameTime = frameTime;
                     }
 
-                    _lastSuccessAt = TimeUtil.MonotonicSeconds();
+                    _lastSuccessAt = frameTime;
                     continue;
                 }
 
@@ -574,6 +583,10 @@ sealed class LatestFrameReader : IDisposable
 
 sealed class CameraWorker : IDisposable
 {
+    private const double CachedResultReuseSeconds = 10.0;
+    private const double StaleFrameThresholdSeconds = 2.0;
+    private const double WaitingTimeSmoothingAlpha = 0.25;
+    private const int ZeroFrameConfirmThreshold = 3;
     private readonly string _cameraKey;
     private readonly LatestFrameReader _reader;
     private readonly YoloOnnxDetector _detector;
@@ -587,6 +600,10 @@ sealed class CameraWorker : IDisposable
     private Task? _workerTask;
     private Mat? _renderedFrame;
     private CameraWorkerStatus _status;
+    private CounterResult? _lastValidResult;
+    private double _lastValidTime;
+    private double? _smoothedWaitingSeconds;
+    private int _zeroFrameCounter = 0;
 
     public CameraWorker(
         string cameraKey,
@@ -663,10 +680,13 @@ sealed class CameraWorker : IDisposable
 
             while (!_cancellation.IsCancellationRequested)
             {
+                var loopNow = TimeUtil.MonotonicSeconds();
                 var (frameId, frame) = _reader.GetLatestFrame();
 
                 if (frame is null)
                 {
+                    ReuseCachedResultIfFresh(loopNow, lastProcessedFrameId, processingFps);
+
                     if (_reader.Ended)
                     {
                         UpdateStatus(s => s with
@@ -684,6 +704,7 @@ sealed class CameraWorker : IDisposable
                 if (frameId <= lastProcessedFrameId)
                 {
                     frame.Dispose();
+                    ReuseCachedResultIfFresh(loopNow, frameId, processingFps);
 
                     if (_reader.Ended && frameId == lastProcessedFrameId)
                     {
@@ -712,6 +733,12 @@ sealed class CameraWorker : IDisposable
                     WaitingStationaryMaxDisplacementPx);
 
                 var counted = _counter.Calculate(analysis);
+                var stableResult = GetStableResult(
+                    now,
+                    detections.Count,
+                    tracks.Count,
+                    counted);
+                var displayResult = ApplyWaitingTimeSmoothing(stableResult);
 
                 processedFrames++;
                 var fpsElapsed = TimeUtil.MonotonicSeconds() - fpsWindowStartedAt;
@@ -735,14 +762,14 @@ sealed class CameraWorker : IDisposable
                     CameraKey: _cameraKey,
                     ProcessingFps: processingFps,
                     FrameId: frameId,
-                    TotalVehicles: counted.TotalVehicles,
-                    Cars: counted.Cars,
-                    BusyChargerSlots: counted.BusyChargerSlots,
-                    RightBusyChargerSlots: counted.RightBusyChargerSlots,
-                    HeavyVehicles: counted.HeavyVehicles,
-                    WaitingLaneVehicles: counted.WaitingLaneVehicles,
-                    StationaryWaitingLaneVehicles: counted.StationaryWaitingLaneVehicles,
-                    WaitingTime: counted.WaitingTime,
+                    TotalVehicles: displayResult.TotalVehicles,
+                    Cars: displayResult.Cars,
+                    BusyChargerSlots: displayResult.BusyChargerSlots,
+                    RightBusyChargerSlots: displayResult.RightBusyChargerSlots,
+                    HeavyVehicles: displayResult.HeavyVehicles,
+                    WaitingLaneVehicles: displayResult.WaitingLaneVehicles,
+                    StationaryWaitingLaneVehicles: displayResult.StationaryWaitingLaneVehicles,
+                    WaitingTime: displayResult.WaitingTime,
                     Ended: false,
                     FailureMessage: null));
 
@@ -766,6 +793,111 @@ sealed class CameraWorker : IDisposable
                 FailureMessage = ex.Message,
             });
         }
+    }
+
+    private CounterResult GetStableResult(
+        double now,
+        int detectionCount,
+        int trackCount,
+        CounterResult counted)
+    {
+        if (trackCount > 0)
+        {
+            _zeroFrameCounter = 0;
+            _lastValidResult = counted;
+            _lastValidTime = now;
+            return counted;
+        }
+
+        _zeroFrameCounter++;
+
+        if (_zeroFrameCounter >= ZeroFrameConfirmThreshold)
+        {
+            return counted;
+        }
+
+        if (TryGetReusableCachedResult(now, out var cachedResult))
+        {
+            return cachedResult;
+        }
+
+        return counted;
+    }
+
+    private CounterResult ApplyWaitingTimeSmoothing(CounterResult result)
+    {
+        var currentWaitingSeconds = ParseDurationSeconds(result.WaitingTime);
+
+        _smoothedWaitingSeconds = _smoothedWaitingSeconds is null
+            ? currentWaitingSeconds
+            : (_smoothedWaitingSeconds.Value * (1.0 - WaitingTimeSmoothingAlpha)) +
+              (currentWaitingSeconds * WaitingTimeSmoothingAlpha);
+
+        return new CounterResult
+        {
+            TotalVehicles = result.TotalVehicles,
+            Cars = result.Cars,
+            HeavyVehicles = result.HeavyVehicles,
+            BusyChargerSlots = result.BusyChargerSlots,
+            RightBusyChargerSlots = result.RightBusyChargerSlots,
+            WaitingLaneVehicles = result.WaitingLaneVehicles,
+            StationaryWaitingLaneVehicles = result.StationaryWaitingLaneVehicles,
+            WaitingTime = TimeUtil.FormatDuration(_smoothedWaitingSeconds.Value),
+        };
+    }
+
+    private void ReuseCachedResultIfFresh(double now, long frameId, double processingFps)
+    {
+        if (!IsFrameStale(now) || !TryGetReusableCachedResult(now, out var cachedResult))
+        {
+            return;
+        }
+
+        UpdateStatus(_ => new CameraWorkerStatus(
+            CameraKey: _cameraKey,
+            ProcessingFps: processingFps,
+            FrameId: _status.FrameId,
+            TotalVehicles: cachedResult.TotalVehicles,
+            Cars: cachedResult.Cars,
+            BusyChargerSlots: cachedResult.BusyChargerSlots,
+            RightBusyChargerSlots: cachedResult.RightBusyChargerSlots,
+            HeavyVehicles: cachedResult.HeavyVehicles,
+            WaitingLaneVehicles: cachedResult.WaitingLaneVehicles,
+            StationaryWaitingLaneVehicles: cachedResult.StationaryWaitingLaneVehicles,
+            WaitingTime: cachedResult.WaitingTime,
+            Ended: false,
+            FailureMessage: null));
+    }
+
+    private bool IsFrameStale(double now)
+    {
+        var lastFrameTime = _reader.LastFrameTime;
+        return lastFrameTime <= 0 || now - lastFrameTime > StaleFrameThresholdSeconds;
+    }
+
+    private bool TryGetReusableCachedResult(double now, out CounterResult result)
+    {
+        if (_lastValidResult is not null && now - _lastValidTime <= CachedResultReuseSeconds)
+        {
+            result = _lastValidResult;
+            return true;
+        }
+
+        result = null!;
+        return false;
+    }
+
+    private static double ParseDurationSeconds(string value)
+    {
+        var parts = value.Split(':', StringSplitOptions.TrimEntries);
+        if (parts.Length != 2 ||
+            !int.TryParse(parts[0], CultureInfo.InvariantCulture, out var minutes) ||
+            !int.TryParse(parts[1], CultureInfo.InvariantCulture, out var seconds))
+        {
+            return 0;
+        }
+
+        return Math.Max(0, minutes * 60 + seconds);
     }
 
     private void DrawRegionsAndTracks(Mat frame, IEnumerable<TrackedVehicle> tracks)
