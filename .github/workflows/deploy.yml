@@ -1,0 +1,41 @@
+name: Deploy Vehicle Counting
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish
+        run: dotnet publish VehicleCountingONNX.csproj --configuration Release --output ./publish
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy publish output to existing release dir
+        run: |
+          rsync -avz --delete -e "ssh -i ~/.ssh/id_ed25519" ./publish/ \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/ubuntu/VehicleCountingONNX/bin/Release/net8.0/linux-x64/
+
+      - name: Restore native lib and restart service
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            cp /home/ubuntu/VehicleCountingONNX/bin/Release/net8.0/linux-x64/libOpenCvSharpExtern.so /home/ubuntu/VehicleCountingONNX/bin/Release/net8.0/linux-x64/libOpenCvSharpExtern.so
+            sudo systemctl restart vehicle-ai.service
+            sudo systemctl status vehicle-ai.service --no-pager
+          EOF
