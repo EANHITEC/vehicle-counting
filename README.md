@@ -102,24 +102,17 @@ Example response:
 ### Response Fields
 
 - `cameraId`: logical camera identifier
-- `WaitingTime`: estimated waiting time in `MM:SS`
+- `WaitingTime`: estimated waiting time in `MM:SS.`
 - `totalVehicles`: total detected vehicles in relevant regions
 - `cars`: detected cars
 - `heavyVehicles`: detected buses and trucks
 
 ## Current Business Logic
 
-- Detection classes are `car`, `bus`, and `truck`
+- Detection classes are `car`, `bus`, and `truck.`
 - Waiting time is driven by the right-side charger and waiting-lane logic
-- Region and queue behavior is tuned for the current station layout
+- Region and queue behavior are tuned for the current station layout
 - The implementation is station-specific, not a generic multi-site backend
-
-## Operational Notes
-
-- HLS (`.m3u8`) streams can lag behind real life
-- RTSP is preferred when lower latency is required
-- Region placement strongly affects counting quality
-- Waiting-time estimation is a business heuristic, not a guaranteed truth source
 
 ## CI
 
@@ -135,10 +128,3 @@ It runs:
 - `dotnet build`
 
 on pushes and pull requests targeting `main`.
-
-## Suggested Next Steps
-
-- add a release process for the ONNX model
-- add a deployment workflow after build validation
-- document environment-specific startup options
-- add debug fields if the frontend needs deeper ETA diagnostics
