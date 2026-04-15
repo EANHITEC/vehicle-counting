@@ -1012,7 +1012,7 @@ class SimpleCounter
 
         var busySlots = _chargers.Count(slot => slot.TrackId is not null);
         var waitingCars = waitingQueue.Count;
-        var queueActive = busySlots == _chargers.Count && waitingCars > 0;
+        var queueActive = busySlots == _chargers.Count;
         var waitingSeconds = queueActive
             ? UpdateActiveQueueCountdown(now, waitingQueue)
             : UpdateInactiveQueueCountdown(now);
