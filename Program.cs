@@ -982,12 +982,20 @@ sealed class CameraWorker : IDisposable
 class SimpleCounter
 {
     private const double ChargerTrackGraceSeconds = 2.5;
+    private const double QueueResetDebounceSeconds = 3.0;
+    private const double QueueIncreaseConfirmSeconds = 2.0;
+    private const double QueueIncreaseThresholdSeconds = 1.0;
     private readonly double _serviceSeconds;
     private readonly List<ChargerSlot> _chargers =
     [
         new ChargerSlot(),
         new ChargerSlot(),
     ];
+    private double? _queueStartTime;
+    private double _queueEstimatedTotalWaitSeconds;
+    private double? _queueInactiveSince;
+    private PendingQueueChange? _pendingQueueIncrease;
+    private QueueSignature? _confirmedQueueSignature;
 
     public SimpleCounter(double serviceMinutes)
     {
@@ -997,16 +1005,17 @@ class SimpleCounter
     public CounterResult Calculate(CameraAnalysis analysis)
     {
         var now = TimeUtil.MonotonicSeconds();
+        var waitingQueue = analysis.StationaryWaitingLaneVehicles;
 
         var rightTracks = GetRightChargerTracks(analysis);
         UpdateChargerSlots(now, rightTracks);
 
-        var simulatedChargers = _chargers
-            .Select(slot => slot.Clone())
-            .ToList();
-        var waitingSeconds = SimulateQueue(now, simulatedChargers, analysis.StationaryWaitingLaneVehicles);
-        var waitingCars = analysis.StationaryWaitingLaneVehicles.Count;
         var busySlots = _chargers.Count(slot => slot.TrackId is not null);
+        var waitingCars = waitingQueue.Count;
+        var queueActive = busySlots == _chargers.Count && waitingCars > 0;
+        var waitingSeconds = queueActive
+            ? UpdateActiveQueueCountdown(now, waitingQueue)
+            : UpdateInactiveQueueCountdown(now);
 
         return new CounterResult
         {
@@ -1019,6 +1028,104 @@ class SimpleCounter
             StationaryWaitingLaneVehicles = waitingCars,
             WaitingTime = TimeUtil.FormatDuration(waitingSeconds),
         };
+    }
+
+    private double UpdateActiveQueueCountdown(double now, List<TrackedVehicle> waitingQueue)
+    {
+        var simulatedChargers = _chargers
+            .Select(slot => slot.Clone())
+            .ToList();
+        var estimatedTotalWaitSeconds = SimulateQueue(now, simulatedChargers, waitingQueue);
+        var signature = BuildQueueSignature(waitingQueue);
+
+        _queueInactiveSince = null;
+
+        if (_queueStartTime is null)
+        {
+            StartQueueCountdown(now, estimatedTotalWaitSeconds, signature);
+            return estimatedTotalWaitSeconds;
+        }
+
+        if (_confirmedQueueSignature == signature)
+        {
+            _pendingQueueIncrease = null;
+            return GetRemainingQueueSeconds(now);
+        }
+
+        var remainingSeconds = GetRemainingQueueSeconds(now);
+        if (estimatedTotalWaitSeconds > remainingSeconds + QueueIncreaseThresholdSeconds)
+        {
+            TryConfirmQueueIncrease(now, signature, estimatedTotalWaitSeconds);
+        }
+        else
+        {
+            _pendingQueueIncrease = null;
+        }
+
+        return GetRemainingQueueSeconds(now);
+    }
+
+    private double UpdateInactiveQueueCountdown(double now)
+    {
+        if (_queueStartTime is null)
+        {
+            return 0;
+        }
+
+        _queueInactiveSince ??= now;
+        _pendingQueueIncrease = null;
+
+        if (now - _queueInactiveSince.Value >= QueueResetDebounceSeconds)
+        {
+            ResetQueueCountdown();
+            return 0;
+        }
+
+        return GetRemainingQueueSeconds(now);
+    }
+
+    private void TryConfirmQueueIncrease(double now, QueueSignature signature, double estimatedTotalWaitSeconds)
+    {
+        if (_pendingQueueIncrease is not null && _pendingQueueIncrease.Value.Signature == signature)
+        {
+            if (now - _pendingQueueIncrease.Value.FirstSeenAt >= QueueIncreaseConfirmSeconds)
+            {
+                StartQueueCountdown(now, estimatedTotalWaitSeconds, signature);
+                _pendingQueueIncrease = null;
+            }
+
+            return;
+        }
+
+        _pendingQueueIncrease = new PendingQueueChange(signature, now);
+    }
+
+    private void StartQueueCountdown(double now, double estimatedTotalWaitSeconds, QueueSignature signature)
+    {
+        _queueStartTime = now;
+        _queueEstimatedTotalWaitSeconds = Math.Max(0.0, estimatedTotalWaitSeconds);
+        _confirmedQueueSignature = signature;
+        _queueInactiveSince = null;
+        _pendingQueueIncrease = null;
+    }
+
+    private double GetRemainingQueueSeconds(double now)
+    {
+        if (_queueStartTime is null)
+        {
+            return 0;
+        }
+
+        return Math.Max(0.0, _queueEstimatedTotalWaitSeconds - (now - _queueStartTime.Value));
+    }
+
+    private void ResetQueueCountdown()
+    {
+        _queueStartTime = null;
+        _queueEstimatedTotalWaitSeconds = 0;
+        _queueInactiveSince = null;
+        _pendingQueueIncrease = null;
+        _confirmedQueueSignature = null;
     }
 
     private List<TrackedVehicle> GetRightChargerTracks(CameraAnalysis analysis)
@@ -1188,12 +1295,30 @@ class SimpleCounter
     private static int GetRequiredSlotCount(TrackedVehicle track) =>
         AppConfig.IsHeavyClass(track.ClassId) ? 2 : 1;
 
+    private static QueueSignature BuildQueueSignature(IEnumerable<TrackedVehicle> waitingQueue)
+    {
+        var queue = waitingQueue.ToList();
+        return new QueueSignature(
+            WaitingVehicleCount: queue.Count,
+            WaitingDemandSlots: queue.Sum(GetRequiredSlotCount),
+            HeavyWaitingCount: queue.Count(track => AppConfig.IsHeavyClass(track.ClassId)));
+    }
+
     private static void ClearSlot(ChargerSlot slot)
     {
         slot.TrackId = null;
         slot.BusyUntil = 0;
         slot.LastSeenAt = 0;
     }
+
+    private readonly record struct QueueSignature(
+        int WaitingVehicleCount,
+        int WaitingDemandSlots,
+        int HeavyWaitingCount);
+
+    private readonly record struct PendingQueueChange(
+        QueueSignature Signature,
+        double FirstSeenAt);
 
     private sealed class ChargerSlot
     {
