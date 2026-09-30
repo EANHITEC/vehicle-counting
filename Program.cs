@@ -19,8 +19,9 @@ public static class Program
             var options = AppOptions.Parse(args);
 
             using var snapshotStore = new SnapshotStore();
-            using var apiServer = new VehicleCountApiServer(options, snapshotStore);
-            using var app = new VehicleCountApp(options, snapshotStore);
+            using var frameStore = new FrameStore();
+            using var apiServer = new VehicleCountApiServer(options, snapshotStore, frameStore);
+            using var app = new VehicleCountApp(options, snapshotStore, frameStore);
 
             apiServer.Start();
             app.Run();
@@ -46,11 +47,33 @@ static class AppConfig
     public const int ReferenceFrameWidth = 640;
     public const int ReferenceFrameHeight = 384;
     public const int DefaultImageSize = 640;
-    public const double DefaultMaxReaderFps = 15.0;
+    // Reading a LIVE stream must never be throttled: consuming slower than real time makes the
+    // client fall behind the playlist window until segments expire ("Stream timeout").
+    // Throttle inference instead — that is what leaves CPU headroom for decoding.
+    public const double DefaultMaxReaderFps = 0.0;
+    public const double DefaultMaxProcessFps = 3.0;
     public const double DefaultStaleTrackSeconds = 2.0;
-    public const double DefaultStationaryConfirmSeconds = 2.0;
+    public const double DefaultStationaryConfirmSeconds = 5.0;
     public const double DefaultWaitingStationaryMaxDisplacementPx = 14.0;
-    public const double DefaultEstimatedServiceMinutesPerVehicle = 20.0;
+    // Wanju station charge times, measured per vehicle class.
+    public const double DefaultCarServiceMinutes = 7.0;
+    public const double DefaultHeavyServiceMinutes = 30.0;
+
+    // Class voting. Calling a bus a car is the expensive mistake — it frees a charger slot that is
+    // really blocked and swaps a 30-minute charge for a 7-minute one — so promotion to heavy needs
+    // only a strong minority, while dropping back to car needs a clear majority.
+    public const int DefaultClassHistoryFrames = 20;
+    public const double DefaultClassSwitchMajority = 0.6;
+    public const double DefaultHeavyPromoteShare = 0.35;
+
+    // Tracking across a car <-> bus disagreement. Cost multiplier for matching a detection to a
+    // track of the other bucket; 0 disables it (pre-2026-09-04 behaviour, where the detection
+    // started a NEW track instead — which reset the charger timer and starved the class vote).
+    public const double DefaultCrossBucketMatchPenalty = 1.5;
+
+    // Charger/queue damping: how long a brief track loss may last before the estimate collapses.
+    public const double DefaultChargerTrackGraceSeconds = 8.0;
+    public const double DefaultQueueResetDebounceSeconds = 15.0;
 
     public const double DuplicateIoUThreshold = 0.50;
     public const double DuplicateIntersectionRatioThreshold = 0.70;
@@ -129,16 +152,19 @@ sealed class VehicleCountApp : IDisposable
 {
     private readonly AppOptions _options;
     private readonly SnapshotStore _snapshotStore;
+    private readonly FrameStore _frameStore;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = false };
+    private readonly Stopwatch _debugFrameClock = Stopwatch.StartNew();
 
     private LatestFrameReader? _reader;
     private CameraWorker? _worker;
     private string? _lastJson;
 
-    public VehicleCountApp(AppOptions options, SnapshotStore snapshotStore)
+    public VehicleCountApp(AppOptions options, SnapshotStore snapshotStore, FrameStore frameStore)
     {
         _options = options;
         _snapshotStore = snapshotStore;
+        _frameStore = frameStore;
     }
 
     public void Run()
@@ -176,8 +202,17 @@ sealed class VehicleCountApp : IDisposable
             staleTrackSeconds: _options.StaleTrackSeconds,
             stationaryConfirmSeconds: _options.StationaryConfirmSeconds,
             waitingStationaryMaxDisplacementPx: _options.WaitingStationaryMaxDisplacementPx,
-            serviceMinutesPerVehicle: _options.ServiceMinutesPerVehicle,
-            renderFrames: _options.View);
+            carServiceMinutes: _options.CarServiceMinutes,
+            heavyServiceMinutes: _options.HeavyServiceMinutes,
+            classHistoryFrames: _options.ClassHistoryFrames,
+            classSwitchMajority: _options.ClassSwitchMajority,
+            heavyPromoteShare: _options.HeavyPromoteShare,
+            crossBucketMatchPenalty: _options.CrossBucketMatchPenalty,
+            chargerTrackGraceSeconds: _options.ChargerTrackGraceSeconds,
+            queueResetDebounceSeconds: _options.QueueResetDebounceSeconds,
+            maxProcessFps: _options.MaxProcessFps,
+            logStats: _options.LogStats,
+            renderFrames: _options.View || _options.DebugFrame);
 
         _worker.Start();
 
@@ -200,13 +235,23 @@ sealed class VehicleCountApp : IDisposable
                 var snapshot = BuildSnapshot(status);
                 EmitSnapshot(snapshot);
 
-                if (_options.View)
+                if (_options.View || _options.DebugFrame)
                 {
                     using var frame = _worker.GetRenderedFrame();
                     if (frame is not null)
                     {
                         DrawSummary(frame, snapshot);
-                        Cv2.ImShow("Camera 2", frame);
+
+                        if (_options.View)
+                        {
+                            Cv2.ImShow("Camera 2", frame);
+                        }
+
+                        if (_options.DebugFrame && _debugFrameClock.ElapsedMilliseconds >= 500)
+                        {
+                            _debugFrameClock.Restart();
+                            CaptureDebugFrame(frame);
+                        }
                     }
                 }
 
@@ -243,6 +288,11 @@ sealed class VehicleCountApp : IDisposable
             RightBusyChargerSlots = status.RightBusyChargerSlots,
             WaitingLaneVehicles = status.WaitingLaneVehicles,
             StationaryWaitingLaneVehicles = status.StationaryWaitingLaneVehicles,
+            WaitingVehicles = status.StationaryWaitingLaneVehicles,
+            WaitingCars = status.WaitingCars,
+            WaitingHeavyVehicles = status.WaitingHeavyVehicles,
+            ChargersBusy = status.BusyChargerSlots,
+            ChargersTotal = status.ChargerSlotsTotal,
         };
     }
 
@@ -267,15 +317,63 @@ sealed class VehicleCountApp : IDisposable
         Console.Error.WriteLine($"model         : {_options.ModelPath}");
         Console.Error.WriteLine($"source        : {_options.Source}");
         Console.Error.WriteLine($"imgsz         : {_options.ImageSize}");
-        Console.Error.WriteLine($"reader fps    : {_options.MaxReaderFps:0.0}");
+        Console.Error.WriteLine($"reader fps    : {_options.MaxReaderFps:0.0} (0 = unlimited)");
+        Console.Error.WriteLine($"process fps   : {_options.MaxProcessFps:0.0} (0 = unlimited)");
         Console.Error.WriteLine($"classes       : {AppConfig.DescribeSupportedClasses()}");
         Console.Error.WriteLine($"conf / nms    : {_options.ConfidenceThreshold:0.00} / {_options.NmsThreshold:0.00}");
-        Console.Error.WriteLine($"service min   : {_options.ServiceMinutesPerVehicle:0.0}");
+        Console.Error.WriteLine($"charge min    : car {_options.CarServiceMinutes:0.0} / heavy {_options.HeavyServiceMinutes:0.0}");
+        Console.Error.WriteLine(
+            $"class vote    : {_options.ClassHistoryFrames} frames, switch {_options.ClassSwitchMajority:0.00}, " +
+            $"heavy promote {_options.HeavyPromoteShare:0.00}, cross-bucket x{_options.CrossBucketMatchPenalty:0.0}");
+        Console.Error.WriteLine(
+            $"queue damping : charger grace {_options.ChargerTrackGraceSeconds:0.0}s, " +
+            $"reset debounce {_options.QueueResetDebounceSeconds:0.0}s");
         Console.Error.WriteLine($"stationary sec: {_options.StationaryConfirmSeconds:0.0}s");
         Console.Error.WriteLine($"stale sec     : {_options.StaleTrackSeconds:0.0}s");
         Console.Error.WriteLine($"view enabled  : {_options.View}");
-        Console.Error.WriteLine($"API endpoint  : {new Uri(new Uri(_options.ListenPrefix), _options.ApiRoute.TrimStart('/'))}");
+        Console.Error.WriteLine($"debug frame   : {_options.DebugFrame}");
+        Console.Error.WriteLine($"API endpoint  : {DescribeApiEndpoint()}");
         Console.Error.WriteLine("mode          : single camera + latest frame + simple waiting logic");
+    }
+
+    // ListenPrefix may be a HttpListener wildcard ("http://+:8080/" or "http://*:8080/"),
+    // which System.Uri cannot parse. Only used for the startup log line, so never let it throw.
+    private string DescribeApiEndpoint()
+    {
+        var route = "/" + _options.ApiRoute.TrimStart('/');
+        var prefix = _options.ListenPrefix.TrimEnd('/');
+
+        try
+        {
+            var parsable = prefix
+                .Replace("://+:", "://0.0.0.0:")
+                .Replace("://*:", "://0.0.0.0:");
+            return new Uri(new Uri(parsable + "/"), route.TrimStart('/')).ToString();
+        }
+        catch (UriFormatException)
+        {
+            return prefix + route;
+        }
+    }
+
+    private void CaptureDebugFrame(Mat frame)
+    {
+        try
+        {
+            // Cv2.ImEncode returns void in OpenCvSharp 4.13 — check the buffer instead.
+            Cv2.ImEncode(".jpg", frame, out var buffer,
+                new ImageEncodingParam(ImwriteFlags.JpegQuality, 80));
+
+            if (buffer is { Length: > 0 })
+            {
+                _frameStore.Update(buffer);
+            }
+        }
+        catch (Exception ex)
+        {
+            // The debug frame is a diagnostic aid; never let it take the service down.
+            Console.Error.WriteLine($"[debug-frame] encode failed: {ex.Message}");
+        }
     }
 
     private static void DrawSummary(Mat frame, Snapshot snapshot)
@@ -290,6 +388,8 @@ sealed class VehicleCountApp : IDisposable
             $"rightBusyChargerSlots: {snapshot.RightBusyChargerSlots}",
             $"waitingLaneVehicles: {snapshot.WaitingLaneVehicles}",
             $"stationaryWaiting: {snapshot.StationaryWaitingLaneVehicles}",
+            $"waiting car/heavy: {snapshot.WaitingCars}/{snapshot.WaitingHeavyVehicles}",
+            $"chargers: {snapshot.ChargersBusy}/{snapshot.ChargersTotal}",
         };
 
         for (var i = 0; i < lines.Length; i++)
@@ -585,7 +685,14 @@ sealed class CameraWorker : IDisposable
 {
     private const double CachedResultReuseSeconds = 10.0;
     private const double StaleFrameThresholdSeconds = 2.0;
-    private const double WaitingTimeSmoothingAlpha = 0.25;
+    // Smoothing was hiding count flicker by dragging the displayed wait time slowly toward the new
+    // value — which showed users a wait time that kept RISING. Flicker is now handled at the source
+    // (DebounceCounts + the queue confirm/reset debounces), so the displayed value tracks reality.
+    private const double WaitingTimeSmoothingAlpha = 1.0;
+
+    // A count must hold this long before it is published. Stops 2 -> 1 -> 2 single-frame flicker
+    // from reaching the website.
+    private const double CountConfirmSeconds = 3.0;
     private const int ZeroFrameConfirmThreshold = 3;
     private readonly string _cameraKey;
     private readonly LatestFrameReader _reader;
@@ -594,6 +701,9 @@ sealed class CameraWorker : IDisposable
     private readonly List<Region> _regions;
     private readonly SimpleCounter _counter;
     private readonly bool _renderFrames;
+    private readonly double _maxProcessFps;
+    private readonly bool _logStats;
+    private double _lastProcessedAt;
     private readonly object _sync = new();
     private readonly CancellationTokenSource _cancellation = new();
 
@@ -602,6 +712,9 @@ sealed class CameraWorker : IDisposable
     private CameraWorkerStatus _status;
     private CounterResult? _lastValidResult;
     private double _lastValidTime;
+    private (int Total, int Cars, int Heavy)? _publishedCounts;
+    private (int Total, int Cars, int Heavy)? _candidateCounts;
+    private double _candidateSince;
     private double? _smoothedWaitingSeconds;
     private int _zeroFrameCounter = 0;
 
@@ -616,15 +729,36 @@ sealed class CameraWorker : IDisposable
         double staleTrackSeconds,
         double stationaryConfirmSeconds,
         double waitingStationaryMaxDisplacementPx,
-        double serviceMinutesPerVehicle,
+        double carServiceMinutes,
+        double heavyServiceMinutes,
+        int classHistoryFrames,
+        double classSwitchMajority,
+        double heavyPromoteShare,
+        double crossBucketMatchPenalty,
+        double chargerTrackGraceSeconds,
+        double queueResetDebounceSeconds,
+        double maxProcessFps,
+        bool logStats,
         bool renderFrames)
     {
         _cameraKey = cameraKey;
         _reader = reader;
         _detector = new YoloOnnxDetector(modelPath, imageSize, confidenceThreshold, nmsThreshold);
-        _tracker = new SimpleTracker(cameraKey, staleTrackSeconds);
+        _tracker = new SimpleTracker(
+            cameraKey,
+            staleTrackSeconds,
+            classHistoryFrames,
+            classSwitchMajority,
+            heavyPromoteShare,
+            crossBucketMatchPenalty);
         _regions = regions;
-        _counter = new SimpleCounter(serviceMinutesPerVehicle);
+        _counter = new SimpleCounter(
+            carServiceMinutes,
+            heavyServiceMinutes,
+            chargerTrackGraceSeconds,
+            queueResetDebounceSeconds);
+        _maxProcessFps = maxProcessFps;
+        _logStats = logStats;
         _renderFrames = renderFrames;
 
         StationaryConfirmSeconds = stationaryConfirmSeconds;
@@ -678,6 +812,11 @@ sealed class CameraWorker : IDisposable
             var fpsWindowStartedAt = TimeUtil.MonotonicSeconds();
             var processingFps = 0.0;
 
+            // Periodic throughput report — without it, CPU tuning is guesswork.
+            var statsLoggedAt = TimeUtil.MonotonicSeconds();
+            var detectMsTotal = 0.0;
+            var detectSamples = 0;
+
             while (!_cancellation.IsCancellationRequested)
             {
                 var loopNow = TimeUtil.MonotonicSeconds();
@@ -720,10 +859,35 @@ sealed class CameraWorker : IDisposable
                     continue;
                 }
 
+                if (_maxProcessFps > 0.0)
+                {
+                    var minInterval = 1.0 / _maxProcessFps;
+                    var sinceLastProcess = loopNow - _lastProcessedAt;
+
+                    if (sinceLastProcess < minInterval)
+                    {
+                        // Skip this frame. The reader keeps consuming the stream at full rate;
+                        // we simply do not spend CPU on inference more often than asked.
+                        frame.Dispose();
+                        ReuseCachedResultIfFresh(loopNow, frameId, processingFps);
+
+                        var waitMs = (int)Math.Ceiling((minInterval - sinceLastProcess) * 1000);
+                        await Task.Delay(Math.Max(5, waitMs), _cancellation.Token)
+                            .ContinueWith(_ => { });
+                        continue;
+                    }
+                }
+
+                _lastProcessedAt = loopNow;
                 lastProcessedFrameId = frameId;
 
                 var now = TimeUtil.MonotonicSeconds();
+
+                var detectStartedAt = TimeUtil.MonotonicSeconds();
                 var detections = _detector.Detect(frame);
+                detectMsTotal += (TimeUtil.MonotonicSeconds() - detectStartedAt) * 1000.0;
+                detectSamples++;
+
                 var tracks = _tracker.Update(detections, now);
 
                 var analysis = CameraAnalyzer.Analyze(
@@ -738,7 +902,8 @@ sealed class CameraWorker : IDisposable
                     detections.Count,
                     tracks.Count,
                     counted);
-                var displayResult = ApplyWaitingTimeSmoothing(stableResult);
+                var debouncedResult = DebounceCounts(now, stableResult);
+                var displayResult = ApplyWaitingTimeSmoothing(debouncedResult);
 
                 processedFrames++;
                 var fpsElapsed = TimeUtil.MonotonicSeconds() - fpsWindowStartedAt;
@@ -747,6 +912,17 @@ sealed class CameraWorker : IDisposable
                     processingFps = processedFrames / Math.Max(fpsElapsed, 1e-6);
                     processedFrames = 0;
                     fpsWindowStartedAt = TimeUtil.MonotonicSeconds();
+
+                    if (_logStats && fpsWindowStartedAt - statsLoggedAt >= 15.0)
+                    {
+                        var avgDetectMs = detectSamples > 0 ? detectMsTotal / detectSamples : 0.0;
+                        Console.Error.WriteLine(
+                            $"[stats] processing {processingFps:0.00} fps, inference {avgDetectMs:0} ms/frame");
+
+                        statsLoggedAt = fpsWindowStartedAt;
+                        detectMsTotal = 0.0;
+                        detectSamples = 0;
+                    }
                 }
 
                 Mat? rendered = null;
@@ -771,7 +947,10 @@ sealed class CameraWorker : IDisposable
                     StationaryWaitingLaneVehicles: displayResult.StationaryWaitingLaneVehicles,
                     WaitingTime: displayResult.WaitingTime,
                     Ended: false,
-                    FailureMessage: null));
+                    FailureMessage: null,
+                    WaitingCars: displayResult.WaitingCars,
+                    WaitingHeavyVehicles: displayResult.WaitingHeavyVehicles,
+                    ChargerSlotsTotal: displayResult.ChargerSlotsTotal));
 
                 lock (_sync)
                 {
@@ -824,6 +1003,48 @@ sealed class CameraWorker : IDisposable
         return counted;
     }
 
+    private CounterResult DebounceCounts(double now, CounterResult result)
+    {
+        var incoming = (result.TotalVehicles, result.Cars, result.HeavyVehicles);
+
+        if (_publishedCounts is null || incoming == _publishedCounts.Value)
+        {
+            _publishedCounts = incoming;
+            _candidateCounts = null;
+            return result;
+        }
+
+        if (_candidateCounts is null || incoming != _candidateCounts.Value)
+        {
+            // A new value appeared. Start its clock; do not publish it yet.
+            _candidateCounts = incoming;
+            _candidateSince = now;
+        }
+        else if (now - _candidateSince >= CountConfirmSeconds)
+        {
+            _publishedCounts = incoming;
+            _candidateCounts = null;
+            return result;
+        }
+
+        var held = _publishedCounts.Value;
+
+        return new CounterResult
+        {
+            TotalVehicles = held.Total,
+            Cars = held.Cars,
+            HeavyVehicles = held.Heavy,
+            BusyChargerSlots = result.BusyChargerSlots,
+            RightBusyChargerSlots = result.RightBusyChargerSlots,
+            WaitingLaneVehicles = result.WaitingLaneVehicles,
+            StationaryWaitingLaneVehicles = result.StationaryWaitingLaneVehicles,
+            WaitingTime = result.WaitingTime,
+            WaitingCars = result.WaitingCars,
+            WaitingHeavyVehicles = result.WaitingHeavyVehicles,
+            ChargerSlotsTotal = result.ChargerSlotsTotal,
+        };
+    }
+
     private CounterResult ApplyWaitingTimeSmoothing(CounterResult result)
     {
         var currentWaitingSeconds = ParseDurationSeconds(result.WaitingTime);
@@ -843,6 +1064,9 @@ sealed class CameraWorker : IDisposable
             WaitingLaneVehicles = result.WaitingLaneVehicles,
             StationaryWaitingLaneVehicles = result.StationaryWaitingLaneVehicles,
             WaitingTime = TimeUtil.FormatDuration(_smoothedWaitingSeconds.Value),
+            WaitingCars = result.WaitingCars,
+            WaitingHeavyVehicles = result.WaitingHeavyVehicles,
+            ChargerSlotsTotal = result.ChargerSlotsTotal,
         };
     }
 
@@ -866,7 +1090,10 @@ sealed class CameraWorker : IDisposable
             StationaryWaitingLaneVehicles: cachedResult.StationaryWaitingLaneVehicles,
             WaitingTime: cachedResult.WaitingTime,
             Ended: false,
-            FailureMessage: null));
+            FailureMessage: null,
+            WaitingCars: cachedResult.WaitingCars,
+            WaitingHeavyVehicles: cachedResult.WaitingHeavyVehicles,
+            ChargerSlotsTotal: cachedResult.ChargerSlotsTotal));
     }
 
     private bool IsFrameStale(double now)
@@ -981,11 +1208,12 @@ sealed class CameraWorker : IDisposable
 
 class SimpleCounter
 {
-    private const double ChargerTrackGraceSeconds = 2.5;
-    private const double QueueResetDebounceSeconds = 3.0;
     private const double QueueIncreaseConfirmSeconds = 2.0;
     private const double QueueIncreaseThresholdSeconds = 1.0;
-    private readonly double _serviceSeconds;
+    private readonly double _carServiceSeconds;
+    private readonly double _heavyServiceSeconds;
+    private readonly double _chargerTrackGraceSeconds;
+    private readonly double _queueResetDebounceSeconds;
     private readonly List<ChargerSlot> _chargers =
     [
         new ChargerSlot(),
@@ -997,10 +1225,21 @@ class SimpleCounter
     private PendingQueueChange? _pendingQueueIncrease;
     private QueueSignature? _confirmedQueueSignature;
 
-    public SimpleCounter(double serviceMinutes)
+    public SimpleCounter(
+        double carServiceMinutes,
+        double heavyServiceMinutes,
+        double chargerTrackGraceSeconds,
+        double queueResetDebounceSeconds)
     {
-        _serviceSeconds = serviceMinutes * 60;
+        _carServiceSeconds = carServiceMinutes * 60;
+        _heavyServiceSeconds = heavyServiceMinutes * 60;
+        _chargerTrackGraceSeconds = Math.Max(0.0, chargerTrackGraceSeconds);
+        _queueResetDebounceSeconds = Math.Max(0.0, queueResetDebounceSeconds);
     }
+
+    // Charge time depends on what is plugged in, not on an average.
+    private double GetServiceSeconds(TrackedVehicle track) =>
+        AppConfig.IsHeavyClass(track.ClassId) ? _heavyServiceSeconds : _carServiceSeconds;
 
     public CounterResult Calculate(CameraAnalysis analysis)
     {
@@ -1027,6 +1266,9 @@ class SimpleCounter
             WaitingLaneVehicles = analysis.WaitingLaneVehicles.Count,
             StationaryWaitingLaneVehicles = waitingCars,
             WaitingTime = TimeUtil.FormatDuration(waitingSeconds),
+            WaitingCars = waitingQueue.Count(track => AppConfig.IsCarClass(track.ClassId)),
+            WaitingHeavyVehicles = waitingQueue.Count(track => AppConfig.IsHeavyClass(track.ClassId)),
+            ChargerSlotsTotal = _chargers.Count,
         };
     }
 
@@ -1075,7 +1317,7 @@ class SimpleCounter
         _queueInactiveSince ??= now;
         _pendingQueueIncrease = null;
 
-        if (now - _queueInactiveSince.Value >= QueueResetDebounceSeconds)
+        if (now - _queueInactiveSince.Value >= _queueResetDebounceSeconds)
         {
             ResetQueueCountdown();
             return 0;
@@ -1205,7 +1447,7 @@ class SimpleCounter
 
             // FIFO is preserved by scheduling each waiting vehicle in arrival order.
             var startTime = selectedSlots.Max(slot => slot.BusyUntil);
-            var endTime = Math.Max(now, startTime) + _serviceSeconds;
+            var endTime = Math.Max(now, startTime) + GetServiceSeconds(track);
 
             foreach (var slot in selectedSlots)
             {
@@ -1232,7 +1474,7 @@ class SimpleCounter
             }
 
             var lastSeenAt = group.Max(slot => slot.LastSeenAt);
-            if (now - lastSeenAt <= ChargerTrackGraceSeconds)
+            if (now - lastSeenAt <= _chargerTrackGraceSeconds)
             {
                 continue;
             }
@@ -1258,13 +1500,15 @@ class SimpleCounter
             assignedSlots.RemoveAt(assignedSlots.Count - 1);
         }
 
+        var serviceSeconds = GetServiceSeconds(track);
+
         var busyUntil = assignedSlots.Count > 0
             ? assignedSlots.Max(slot => slot.BusyUntil)
-            : now + _serviceSeconds;
+            : now + serviceSeconds;
 
         if (busyUntil <= now)
         {
-            busyUntil = now + _serviceSeconds;
+            busyUntil = now + serviceSeconds;
         }
 
         var missingSlots = requiredSlots - assignedSlots.Count;
@@ -1351,7 +1595,10 @@ sealed record CameraWorkerStatus(
     int StationaryWaitingLaneVehicles,
     string WaitingTime,
     bool Ended,
-    string? FailureMessage)
+    string? FailureMessage,
+    int WaitingCars = 0,
+    int WaitingHeavyVehicles = 0,
+    int ChargerSlotsTotal = 0)
 {
     public static CameraWorkerStatus Empty(string cameraKey) =>
         new(
@@ -1604,18 +1851,53 @@ sealed class SnapshotStore : IDisposable
     }
 }
 
+sealed class FrameStore : IDisposable
+{
+    private readonly object _sync = new();
+    private byte[]? _jpeg;
+
+    public void Update(byte[] jpeg)
+    {
+        lock (_sync)
+        {
+            _jpeg = jpeg;
+        }
+    }
+
+    public bool TryGetLatestJpeg(out byte[] jpeg)
+    {
+        lock (_sync)
+        {
+            if (_jpeg is null)
+            {
+                jpeg = Array.Empty<byte>();
+                return false;
+            }
+
+            jpeg = _jpeg;
+            return true;
+        }
+    }
+
+    public void Dispose()
+    {
+    }
+}
+
 sealed class VehicleCountApiServer : IDisposable
 {
     private readonly AppOptions _options;
     private readonly SnapshotStore _snapshotStore;
+    private readonly FrameStore _frameStore;
     private readonly HttpListener _listener = new();
     private readonly CancellationTokenSource _cancellation = new();
     private Task? _serverTask;
 
-    public VehicleCountApiServer(AppOptions options, SnapshotStore snapshotStore)
+    public VehicleCountApiServer(AppOptions options, SnapshotStore snapshotStore, FrameStore frameStore)
     {
         _options = options;
         _snapshotStore = snapshotStore;
+        _frameStore = frameStore;
         _listener.Prefixes.Add(NormalizePrefix(options.ListenPrefix));
     }
 
@@ -1678,6 +1960,22 @@ sealed class VehicleCountApiServer : IDisposable
                 return;
             }
 
+            if (context.Request.HttpMethod == "GET" &&
+                (requestPath == "/frame.jpg" || requestPath == "/frame"))
+            {
+                if (_frameStore.TryGetLatestJpeg(out var jpeg))
+                {
+                    await WriteBinaryAsync(context.Response, 200, "image/jpeg", jpeg);
+                }
+                else
+                {
+                    await WriteJsonAsync(context.Response, 503,
+                        """{"message":"No debug frame yet. Start the app with --debug-frame."}""");
+                }
+
+                return;
+            }
+
             await WriteJsonAsync(context.Response, 404, """{"message":"Not found"}""");
         }
         catch
@@ -1695,6 +1993,17 @@ sealed class VehicleCountApiServer : IDisposable
         response.StatusCode = statusCode;
         response.ContentType = "application/json";
         response.ContentEncoding = Encoding.UTF8;
+        response.ContentLength64 = payload.LongLength;
+        response.Headers["Cache-Control"] = "no-store";
+        await response.OutputStream.WriteAsync(payload);
+        response.Close();
+    }
+
+    private static async Task WriteBinaryAsync(
+        HttpListenerResponse response, int statusCode, string contentType, byte[] payload)
+    {
+        response.StatusCode = statusCode;
+        response.ContentType = contentType;
         response.ContentLength64 = payload.LongLength;
         response.Headers["Cache-Control"] = "no-store";
         await response.OutputStream.WriteAsync(payload);
@@ -1996,15 +2305,32 @@ sealed class YoloOnnxDetector : IDisposable
 
 sealed class SimpleTracker
 {
+    // A vehicle's class does not change from frame to frame — only the detector's opinion does.
+    // Vote over a window, and require a clear majority before switching, so a 50/50 car/bus
+    // split cannot flip the reported class on every frame.
     private readonly string _cameraKey;
     private readonly Dictionary<int, TrackedVehicle> _tracks = new();
     private readonly double _staleTrackSeconds;
+    private readonly int _classHistoryLimit;
+    private readonly double _classSwitchMajority;
+    private readonly double _heavyPromoteShare;
+    private readonly double _crossBucketMatchPenalty;
     private int _nextTrackId = 1;
 
-    public SimpleTracker(string cameraKey, double staleTrackSeconds)
+    public SimpleTracker(
+        string cameraKey,
+        double staleTrackSeconds,
+        int classHistoryFrames,
+        double classSwitchMajority,
+        double heavyPromoteShare,
+        double crossBucketMatchPenalty)
     {
         _cameraKey = cameraKey;
         _staleTrackSeconds = Math.Max(0.1, staleTrackSeconds);
+        _classHistoryLimit = Math.Max(1, classHistoryFrames);
+        _classSwitchMajority = Math.Clamp(classSwitchMajority, 0.0, 1.0);
+        _heavyPromoteShare = Math.Clamp(heavyPromoteShare, 0.0, 1.0);
+        _crossBucketMatchPenalty = Math.Max(0.0, crossBucketMatchPenalty);
     }
 
     public List<TrackedVehicle> Update(List<Detection> detections, double nowSeconds)
@@ -2036,17 +2362,12 @@ sealed class SimpleTracker
             }
 
             track.ClassHistory.Add(detection.ClassId);
-            if (track.ClassHistory.Count > 8)
+            if (track.ClassHistory.Count > _classHistoryLimit)
             {
                 track.ClassHistory.RemoveAt(0);
             }
 
-            track.ClassId = track.ClassHistory
-                .GroupBy(classId => classId)
-                .OrderByDescending(group => group.Count())
-                .ThenByDescending(group => group.Last())
-                .First()
-                .Key;
+            track.ClassId = ResolveStableClass(track);
         }
 
         var matchedDetectionIndexes = assignments
@@ -2104,7 +2425,14 @@ sealed class SimpleTracker
             {
                 var detection = detections[i];
 
-                if (!BucketsCompatible(track.ClassId, detection.ClassId))
+                var sameBucket = BucketsCompatible(track.ClassId, detection.ClassId);
+
+                // A car <-> bus disagreement is the detector changing its mind about ONE vehicle,
+                // not a second vehicle appearing. Refusing the match here spawned a NEW track every
+                // time the label flipped: the counts jumped, the charger timer restarted, and the
+                // class vote never saw the opposing votes it needs. Allow the match, but let a
+                // same-bucket candidate win whenever one is in range.
+                if (!sameBucket && _crossBucketMatchPenalty <= 0.0)
                 {
                     continue;
                 }
@@ -2117,7 +2445,8 @@ sealed class SimpleTracker
 
                 if (distance <= maxDistance)
                 {
-                    candidates.Add(new Assignment(track.TrackId, i, distance));
+                    var cost = sameBucket ? distance : distance * _crossBucketMatchPenalty;
+                    candidates.Add(new Assignment(track.TrackId, i, cost));
                 }
             }
         }
@@ -2140,6 +2469,41 @@ sealed class SimpleTracker
         }
 
         return assignments;
+    }
+
+    private int ResolveStableClass(TrackedVehicle track)
+    {
+        // Deterministic tie-break, and on a tie the heavier class wins: a bus mislabelled as a car
+        // frees a charger slot that is really blocked, which is the worse of the two errors.
+        var challenger = track.ClassHistory
+            .GroupBy(classId => classId)
+            .OrderByDescending(group => group.Count())
+            .ThenByDescending(group => group.Key)
+            .First();
+
+        if (challenger.Key == track.ClassId)
+        {
+            return track.ClassId;
+        }
+
+        var currentCount = track.ClassHistory.Count(classId => classId == track.ClassId);
+
+        // Asymmetric on purpose: promoting to heavy needs only a strong minority, demoting back to
+        // car needs a clear majority. A symmetric majority let a bus that was seen as a car early
+        // stay a car for as long as it sat there.
+        var promotingToHeavy =
+            AppConfig.IsHeavyClass(challenger.Key) && !AppConfig.IsHeavyClass(track.ClassId);
+
+        var share = promotingToHeavy ? _heavyPromoteShare : _classSwitchMajority;
+
+        if (challenger.Count() < track.ClassHistory.Count * share)
+        {
+            return track.ClassId;
+        }
+
+        return promotingToHeavy || challenger.Count() > currentCount
+            ? challenger.Key
+            : track.ClassId;
     }
 
     private static double Distance(Point2f a, Point2f b)
@@ -2168,11 +2532,31 @@ sealed class AppOptions
     public required string ListenPrefix { get; init; }
     public required string ApiRoute { get; init; }
     public required bool View { get; init; }
+
+    public required bool DebugFrame { get; init; }
     public required int ImageSize { get; init; }
     public required double MaxReaderFps { get; init; }
+
+    public required double MaxProcessFps { get; init; }
+
+    public required bool LogStats { get; init; }
     public required float ConfidenceThreshold { get; init; }
     public required float NmsThreshold { get; init; }
-    public required double ServiceMinutesPerVehicle { get; init; }
+    public required double CarServiceMinutes { get; init; }
+
+    public required double HeavyServiceMinutes { get; init; }
+
+    public required int ClassHistoryFrames { get; init; }
+
+    public required double ClassSwitchMajority { get; init; }
+
+    public required double HeavyPromoteShare { get; init; }
+
+    public required double CrossBucketMatchPenalty { get; init; }
+
+    public required double ChargerTrackGraceSeconds { get; init; }
+
+    public required double QueueResetDebounceSeconds { get; init; }
     public required double StaleTrackSeconds { get; init; }
     public required double StationaryConfirmSeconds { get; init; }
     public required double WaitingStationaryMaxDisplacementPx { get; init; }
@@ -2186,11 +2570,21 @@ sealed class AppOptions
         var listenPrefix = "http://localhost:8080/";
         var apiRoute = "/vehicle-count";
         var view = false;
+        var debugFrame = false;
         var imageSize = AppConfig.DefaultImageSize;
         var maxReaderFps = AppConfig.DefaultMaxReaderFps;
+        var maxProcessFps = AppConfig.DefaultMaxProcessFps;
+        var logStats = false;
         var confidenceThreshold = 0.25f;
         var nmsThreshold = 0.45f;
-        var serviceMinutesPerVehicle = AppConfig.DefaultEstimatedServiceMinutesPerVehicle;
+        var carServiceMinutes = AppConfig.DefaultCarServiceMinutes;
+        var heavyServiceMinutes = AppConfig.DefaultHeavyServiceMinutes;
+        var classHistoryFrames = AppConfig.DefaultClassHistoryFrames;
+        var classSwitchMajority = AppConfig.DefaultClassSwitchMajority;
+        var heavyPromoteShare = AppConfig.DefaultHeavyPromoteShare;
+        var crossBucketMatchPenalty = AppConfig.DefaultCrossBucketMatchPenalty;
+        var chargerTrackGraceSeconds = AppConfig.DefaultChargerTrackGraceSeconds;
+        var queueResetDebounceSeconds = AppConfig.DefaultQueueResetDebounceSeconds;
         var staleTrackSeconds = AppConfig.DefaultStaleTrackSeconds;
         var stationaryConfirmSeconds = AppConfig.DefaultStationaryConfirmSeconds;
         var waitingStationaryMaxDisplacementPx = AppConfig.DefaultWaitingStationaryMaxDisplacementPx;
@@ -2229,6 +2623,14 @@ sealed class AppOptions
                     maxReaderFps = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
                     break;
 
+                case "--max-process-fps":
+                    maxProcessFps = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--stats":
+                    logStats = true;
+                    break;
+
                 case "--conf":
                     confidenceThreshold = float.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
                     break;
@@ -2237,8 +2639,43 @@ sealed class AppOptions
                     nmsThreshold = float.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
                     break;
 
+                case "--car-service-minutes":
+                    carServiceMinutes = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--heavy-service-minutes":
+                case "--bus-service-minutes":
+                    heavyServiceMinutes = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                // Legacy flag: one value for every class. Kept so older commands still run.
                 case "--service-minutes-per-vehicle":
-                    serviceMinutesPerVehicle = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    carServiceMinutes = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    heavyServiceMinutes = carServiceMinutes;
+                    break;
+
+                case "--class-history-frames":
+                    classHistoryFrames = int.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--class-switch-majority":
+                    classSwitchMajority = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--heavy-promote-share":
+                    heavyPromoteShare = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--cross-bucket-match-penalty":
+                    crossBucketMatchPenalty = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--charger-track-grace-seconds":
+                    chargerTrackGraceSeconds = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
+                    break;
+
+                case "--queue-reset-debounce-seconds":
+                    queueResetDebounceSeconds = double.Parse(ReadValue(args, ref i), CultureInfo.InvariantCulture);
                     break;
 
                 case "--stale-track-seconds":
@@ -2256,6 +2693,10 @@ sealed class AppOptions
                 case "--view":
                 case "--view-img":
                     view = true;
+                    break;
+
+                case "--debug-frame":
+                    debugFrame = true;
                     break;
 
                 case "--help":
@@ -2282,11 +2723,21 @@ sealed class AppOptions
             ListenPrefix = listenPrefix,
             ApiRoute = apiRoute,
             View = view,
+            DebugFrame = debugFrame,
             ImageSize = imageSize,
             MaxReaderFps = Math.Max(0.0, maxReaderFps),
+            MaxProcessFps = Math.Max(0.0, maxProcessFps),
+            LogStats = logStats,
             ConfidenceThreshold = confidenceThreshold,
             NmsThreshold = nmsThreshold,
-            ServiceMinutesPerVehicle = Math.Max(0.0, serviceMinutesPerVehicle),
+            CarServiceMinutes = Math.Max(0.0, carServiceMinutes),
+            HeavyServiceMinutes = Math.Max(0.0, heavyServiceMinutes),
+            ClassHistoryFrames = Math.Max(1, classHistoryFrames),
+            ClassSwitchMajority = Math.Clamp(classSwitchMajority, 0.0, 1.0),
+            HeavyPromoteShare = Math.Clamp(heavyPromoteShare, 0.0, 1.0),
+            CrossBucketMatchPenalty = Math.Max(0.0, crossBucketMatchPenalty),
+            ChargerTrackGraceSeconds = Math.Max(0.0, chargerTrackGraceSeconds),
+            QueueResetDebounceSeconds = Math.Max(0.0, queueResetDebounceSeconds),
             StaleTrackSeconds = Math.Max(0.1, staleTrackSeconds),
             StationaryConfirmSeconds = Math.Max(0.2, stationaryConfirmSeconds),
             WaitingStationaryMaxDisplacementPx = Math.Max(1.0, waitingStationaryMaxDisplacementPx),
@@ -2341,14 +2792,25 @@ sealed class AppOptions
             "  --listen-prefix HTTP prefix (default: http://localhost:8080/)",
             "  --api-route     HTTP route (default: /vehicle-count)",
             $"  --imgsz         Inference image size (default: {AppConfig.DefaultImageSize})",
-            $"  --max-reader-fps Reader FPS cap for latest-frame mode (default: {AppConfig.DefaultMaxReaderFps:0.0})",
+            $"  --max-reader-fps Reader FPS cap; 0 = unlimited (default: {AppConfig.DefaultMaxReaderFps:0.0}). Do NOT cap a live stream.",
+            $"  --max-process-fps Inference FPS cap; 0 = unlimited (default: {AppConfig.DefaultMaxProcessFps:0.0})",
+            "  --stats         Log processing fps and inference time every 15s (off by default)",
             "  --conf          Confidence threshold (default: 0.25)",
             "  --nms           NMS / duplicate suppression threshold (default: 0.45)",
-            $"  --service-minutes-per-vehicle Estimated service minutes per queued vehicle (default: {AppConfig.DefaultEstimatedServiceMinutesPerVehicle:0.0})",
+            $"  --car-service-minutes   Charge minutes for a car (default: {AppConfig.DefaultCarServiceMinutes:0.0})",
+            $"  --heavy-service-minutes Charge minutes for a bus or truck (default: {AppConfig.DefaultHeavyServiceMinutes:0.0})",
+            "  --service-minutes-per-vehicle Legacy: sets both of the above to one value",
+            $"  --class-history-frames  Class vote window in frames (default: {AppConfig.DefaultClassHistoryFrames})",
+            $"  --class-switch-majority Share of the window needed to change class (default: {AppConfig.DefaultClassSwitchMajority:0.00})",
+            $"  --heavy-promote-share   Lower share needed to become bus/truck (default: {AppConfig.DefaultHeavyPromoteShare:0.00})",
+            $"  --cross-bucket-match-penalty Cost multiplier for matching a car detection to a heavy track; 0 disables (default: {AppConfig.DefaultCrossBucketMatchPenalty:0.0})",
+            $"  --charger-track-grace-seconds Keep a charger slot this long after losing its track (default: {AppConfig.DefaultChargerTrackGraceSeconds:0.0})",
+            $"  --queue-reset-debounce-seconds Wait this long before zeroing the queue estimate (default: {AppConfig.DefaultQueueResetDebounceSeconds:0.0})",
             $"  --stale-track-seconds Remove tracks after this many seconds without match (default: {AppConfig.DefaultStaleTrackSeconds:0.0})",
             $"  --stationary-confirm-seconds Seconds vehicle must stay almost still (default: {AppConfig.DefaultStationaryConfirmSeconds:0.0})",
             $"  --waiting-stationary-max-displacement-px Max movement to still count as stationary (default: {AppConfig.DefaultWaitingStationaryMaxDisplacementPx:0.0})",
             "  --view          Show OpenCV preview",
+            "  --debug-frame   Serve the annotated frame as JPEG at /frame.jpg (no GUI needed)",
             "",
             $"Supported classes: {AppConfig.DescribeSupportedClasses()}",
         ]);
@@ -2371,6 +2833,23 @@ sealed class Snapshot
 
     [JsonPropertyName("heavyVehicles")]
     public required int HeavyVehicles { get; init; }
+
+    // Diagnostics only — shown on the --debug-frame overlay, deliberately NOT in the JSON payload.
+    // The API contract stays: cameraId, WaitingTime, totalVehicles, cars, heavyVehicles.
+    [JsonIgnore]
+    public int WaitingVehicles { get; init; }
+
+    [JsonIgnore]
+    public int WaitingCars { get; init; }
+
+    [JsonIgnore]
+    public int WaitingHeavyVehicles { get; init; }
+
+    [JsonIgnore]
+    public int ChargersBusy { get; init; }
+
+    [JsonIgnore]
+    public int ChargersTotal { get; init; }
 
     [JsonIgnore]
     public int BusyChargerSlots { get; init; }
@@ -2458,6 +2937,12 @@ sealed class CounterResult
     public required int WaitingLaneVehicles { get; init; }
     public required int StationaryWaitingLaneVehicles { get; init; }
     public required string WaitingTime { get; init; }
+
+    // Waiting-queue breakdown. The station only cares about vehicles that are WAITING —
+    // a vehicle occupying a charger is being served, not waiting.
+    public int WaitingCars { get; init; }
+    public int WaitingHeavyVehicles { get; init; }
+    public int ChargerSlotsTotal { get; init; }
 }
 
 sealed record RegionDefinition(string Name, string Role, Point[] Points, Scalar Color);

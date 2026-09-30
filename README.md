@@ -111,6 +111,11 @@ Example response:
 
 - Detection classes are `car`, `bus`, and `truck.`
 - Waiting time is driven by the right-side charger and waiting-lane logic
+- Charge time depends on the vehicle class (Wanju station):
+  - car — 7 minutes (`--car-service-minutes`)
+  - bus / truck — 30 minutes (`--heavy-service-minutes`)
+- A bus or truck occupies **both** charger slots — it blocks the lane, so no car can reach the
+  second dispenser while it is being filled
 - Region and queue behavior are tuned for the current station layout
 - The implementation is station-specific, not a generic multi-site backend
 
