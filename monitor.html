@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<title>Hydrogen Counter — Live</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #262d36;
+    --fg: #e6edf3; --muted: #8b949e; --ok: #3fb950; --bad: #f85149; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .grow { flex: 1; }
+  label { color: var(--muted); font-size: 12px; margin-right: 6px; }
+  input, select {
+    background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px;
+  }
+  input[type=text] { width: 180px; }
+  button {
+    background: #21262d; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #2d333b; }
+  .status { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .dot.wait { background: var(--warn); }
+  main { padding: 18px; }
+  .frame {
+    background: #000; border: 1px solid var(--line); border-radius: 10px;
+    overflow: hidden; max-width: 1600px; margin: 0 auto; position: relative;
+  }
+  img { display: block; width: 100%; height: auto; }
+  .empty {
+    padding: 80px 20px; text-align: center; color: var(--muted);
+  }
+  .empty code {
+    display: inline-block; margin-top: 10px; padding: 6px 10px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    color: var(--fg); font-size: 12px;
+  }
+  footer { color: var(--muted); font-size: 12px; text-align: center; padding: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Hydrogen Counter — Live</h1>
+
+  <div>
+    <label for="host">Host</label>
+    <input id="host" type="text" value="192.168.0.167:8080">
+  </div>
+
+  <div>
+    <label for="interval">Interval</label>
+    <select id="interval">
+      <option value="500">0.5s</option>
+      <option value="1000" selected>1s</option>
+      <option value="2000">2s</option>
+      <option value="5000">5s</option>
+    </select>
+  </div>
+
+  <button id="toggle">Pauza</button>
+
+  <div class="grow"></div>
+
+  <div class="status">
+    <span class="dot" id="dot"></span>
+    <span id="statusText">ulanmoqda…</span>
+  </div>
+</header>
+
+<main>
+  <div class="frame">
+    <img id="frame" alt="" hidden>
+    <div class="empty" id="empty">
+      Kadr kelmadi.<br>
+      Konteyner <code>--debug-frame</code> bilan ishga tushirilganini tekshiring.
+    </div>
+  </div>
+</main>
+
+<footer>
+  Kadr ustidagi raqamlar dasturning o'zi chizgan qiymatlari — WaitingTime, totalVehicles, cars, heavyVehicles.
+</footer>
+
+<script>
+(function () {
+  var img = document.getElementById('frame');
+  var empty = document.getElementById('empty');
+  var dot = document.getElementById('dot');
+  var statusText = document.getElementById('statusText');
+  var hostInput = document.getElementById('host');
+  var intervalSel = document.getElementById('interval');
+  var toggleBtn = document.getElementById('toggle');
+
+  var timer = null;
+  var running = true;
+  var fails = 0;
+
+  function setStatus(kind, text) {
+    dot.className = 'dot' + (kind ? ' ' + kind : '');
+    statusText.textContent = text;
+  }
+
+  function schedule() {
+    if (!running) return;
+    clearTimeout(timer);
+    timer = setTimeout(load, parseInt(intervalSel.value, 10));
+  }
+
+  function load() {
+    if (!running) return;
+
+    var host = hostInput.value.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    if (!host) { setStatus('bad', 'host kiritilmagan'); return; }
+
+    var next = new Image();
+
+    next.onload = function () {
+      img.src = next.src;
+      img.hidden = false;
+      empty.hidden = true;
+      fails = 0;
+      setStatus('ok', 'ulangan — ' + new Date().toLocaleTimeString());
+      schedule();
+    };
+
+    next.onerror = function () {
+      fails++;
+      // 503 ham shu yerga tushadi: server ishlayotgan bo'lishi mumkin, lekin kadr yo'q
+      setStatus(fails > 2 ? 'bad' : 'wait', 'kadr olinmadi (' + fails + ')');
+      if (fails > 2) { img.hidden = true; empty.hidden = false; }
+      schedule();
+    };
+
+    next.src = 'http://' + host + '/frame.jpg?t=' + Date.now();
+  }
+
+  toggleBtn.addEventListener('click', function () {
+    running = !running;
+    toggleBtn.textContent = running ? 'Pauza' : 'Davom';
+    if (running) { setStatus('wait', 'ulanmoqda…'); load(); }
+    else { clearTimeout(timer); setStatus('', 'to’xtatilgan'); }
+  });
+
+  hostInput.addEventListener('change', function () { fails = 0; load(); });
+  intervalSel.addEventListener('change', schedule);
+
+  setStatus('wait', 'ulanmoqda…');
+  load();
+})();
+</script>
+
+</body>
+</html>

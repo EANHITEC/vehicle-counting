@@ -30,4 +30,16 @@
       SkipUnchangedFiles="true"
       Condition="'@(OpenCvSharpExternFile)' != ''" />
   </Target>
+
+  <Target Name="CopyOpenCvSharpExternToPublish" AfterTargets="Publish">
+    <ItemGroup>
+      <OpenCvSharpExternPublishFile Include="$(NuGetPackageRoot)opencvsharp4.official.runtime.ubuntu.22.04-x64/*/runtimes/ubuntu.22.04-x64/native/libOpenCvSharpExtern.so" />
+    </ItemGroup>
+    <Copy
+      SourceFiles="@(OpenCvSharpExternPublishFile)"
+      DestinationFolder="$(PublishDir)"
+      SkipUnchangedFiles="true"
+      Condition="'@(OpenCvSharpExternPublishFile)' != ''" />
+  </Target>
+
 </Project>
